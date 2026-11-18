@@ -193,7 +193,9 @@ function createTray() {
   // Not every desktop exposes a status area (and some need an AppIndicator
   // extension). The tab is the product; the tray is a convenience.
   try {
-    const icon = nativeImage.createFromPath(path.join(ASSETS, 'tray.png'));
+    let icon = nativeImage.createFromPath(path.join(ASSETS, 'tray.png'));
+    // The menu bar draws images at their point size; 32px would be oversized.
+    if (process.platform === 'darwin' && !icon.isEmpty()) icon = icon.resize({ height: 18 });
     tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
     tray.setToolTip('Sup');
     refreshTrayMenu();

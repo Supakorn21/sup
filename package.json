@@ -18,6 +18,7 @@
     "dist:deb": "electron-builder --linux deb --publish never",
     "dist:linux": "electron-builder --linux deb AppImage --publish never",
     "dist:win": "electron-builder --win nsis portable --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
     "pack": "electron-builder --dir --publish never"
   },
   "dependencies": {

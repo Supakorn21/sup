@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 
@@ -42,19 +44,59 @@ function detectVersion() {
   });
 }
 
-function readCredentials(dir) {
-  // Linux and Windows keep the OAuth blob on disk; macOS uses the keychain,
-  // which we cannot reach from here (and do not need to on this platform).
-  const file = path.join(dir, '.credentials.json');
-  const raw = readJson(file);
+function credentialsFromBlob(raw, source) {
   const oauth = raw && (raw.claudeAiOauth || raw.claude_ai_oauth);
   if (!oauth || !oauth.accessToken) return null;
   return {
     accessToken: oauth.accessToken,
     expiresAt: oauth.expiresAt || null,
     subscriptionType: oauth.subscriptionType || null,
-    source: file,
+    source,
   };
+}
+
+/**
+ * Claude Code on macOS keeps the same OAuth blob in the login keychain under
+ * "Claude Code-credentials". A config dir picked with CLAUDE_CONFIG_DIR gets
+ * its own item, suffixed with the first 8 hex chars of sha256(dir).
+ */
+function keychainServices(dir) {
+  const defaultDir = path.join(os.homedir(), '.claude');
+  const base = 'Claude Code-credentials';
+  if (path.resolve(dir) === defaultDir) return [base];
+  const hash = crypto.createHash('sha256').update(dir).digest('hex').slice(0, 8);
+  return [`${base}-${hash}`];
+}
+
+function readKeychain(service) {
+  return new Promise((resolve) => {
+    execFile(
+      'security',
+      ['find-generic-password', '-s', service, '-w'],
+      { timeout: 10000 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        try {
+          resolve(JSON.parse(String(stdout).trim()));
+        } catch {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+async function readCredentials(dir) {
+  // Linux and Windows keep the OAuth blob on disk; macOS uses the keychain.
+  const file = path.join(dir, '.credentials.json');
+  const fromFile = credentialsFromBlob(readJson(file), file);
+  if (fromFile || process.platform !== 'darwin') return fromFile;
+
+  for (const service of keychainServices(dir)) {
+    const creds = credentialsFromBlob(await readKeychain(service), `keychain:${service}`);
+    if (creds) return creds;
+  }
+  return null;
 }
 
 function windowsFromUsage(payload) {
@@ -157,7 +199,7 @@ async function collectOne({ dir, label }, ctx) {
     })
   );
   const session = summarise(sessions);
-  const creds = readCredentials(dir);
+  const creds = await readCredentials(dir);
   const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   const token = (creds && creds.accessToken) || envToken;
 
@@ -167,7 +209,7 @@ async function collectOne({ dir, label }, ctx) {
       label: displayLabel,
       account,
       status: 'unauthenticated',
-      detail: `No OAuth token in ${path.join(dir, '.credentials.json')} — run \`claude\` and sign in.`,
+      detail: `No OAuth token in ${process.platform === 'darwin' ? 'the keychain or ' : ''}${path.join(dir, '.credentials.json')} — run \`claude\` and sign in.`,
       session,
       sessions,
     });
