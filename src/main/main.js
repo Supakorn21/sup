@@ -77,10 +77,29 @@ function areaFor(config) {
   return config.useWorkArea ? display.workArea : display.bounds;
 }
 
+/**
+ * While the tab is being dragged it follows the pointer without touching the
+ * settings file; the placement is only saved when it is dropped.
+ */
+let dragPlacement = null;
+
+function currentConfig() {
+  const config = settings.load();
+  return dragPlacement ? { ...config, ...dragPlacement } : config;
+}
+
+function placementAt(point) {
+  const displays = screen.getAllDisplays();
+  const display = screen.getDisplayNearestPoint(point);
+  const index = Math.max(0, displays.findIndex((d) => d.id === display.id));
+  const area = settings.load().useWorkArea ? display.workArea : display.bounds;
+  return { ...placement.snapToEdge(point, area), display: index };
+}
+
 function applyBounds() {
   if (!win) return;
-  const config = settings.load();
-  const size = expanded ? placement.expandedSize(config) : placement.collapsedSize(config);
+  const config = currentConfig();
+  const size = expanded || FIXED_SIZE ? placement.expandedSize(config) : placement.collapsedSize(config);
   const bounds = placement.boundsFor(config, areaFor(config), size);
   win.setBounds(bounds);
   if (process.env.SUP_DEV) {
@@ -107,7 +126,7 @@ function showWindow(reason) {
 
 function createWindow() {
   const config = settings.load();
-  const size = placement.collapsedSize(config);
+  const size = FIXED_SIZE ? placement.expandedSize(config) : placement.collapsedSize(config);
   const bounds = placement.boundsFor(config, areaFor(config), size);
 
   const options = {
@@ -140,6 +159,9 @@ function createWindow() {
 
   const created = new BrowserWindow(options);
   win = created;
+  pointerThrough = null;
+  passPointerThrough(true);
+  watchPointer();
 
   win.setAlwaysOnTop(true, config.alwaysOnTopLevel || 'screen-saver');
   // macOS and Linux only; on Windows older Electron builds threw here.
@@ -180,13 +202,49 @@ function recreateWindow() {
 }
 
 function sendConfig() {
-  if (win && !win.isDestroyed()) win.webContents.send('sup:config', settings.load());
+  if (win && !win.isDestroyed()) win.webContents.send('sup:config', currentConfig());
+}
+
+/**
+ * On macOS and Windows the window never changes size. Resizing a transparent
+ * window there is not atomic: the new size lands a few frames before the new
+ * position, so every hover in or out flashed the tab (or a long strip of the
+ * panel) at the wrong spot. Instead the window stays panel-sized and, while
+ * collapsed, lets the pointer through to whatever is underneath.
+ *
+ * A window that lets the pointer through gets no hover events on macOS (even
+ * with `forward`), so the main process watches the pointer itself and stops
+ * letting it through while it is over the tab; the page then sees an ordinary
+ * hover. Linux keeps the resizing window, where the flash was never seen.
+ */
+const FIXED_SIZE = process.platform !== 'linux';
+const POINTER_POLL_MS = 100;
+
+let pointerThrough = null;
+let pointerTimer = null;
+
+function passPointerThrough(through) {
+  if (!FIXED_SIZE || !win || win.isDestroyed() || pointerThrough === through) return;
+  pointerThrough = through;
+  win.setIgnoreMouseEvents(through, { forward: true });
+}
+
+function watchPointer() {
+  if (!FIXED_SIZE || pointerTimer) return;
+  pointerTimer = setInterval(() => {
+    if (!win || win.isDestroyed() || expanded || dragPlacement) return;
+    const config = currentConfig();
+    const tab = placement.tabRect(config.edge, win.getBounds(), placement.collapsedSize(config));
+    passPointerThrough(!placement.contains(tab, screen.getCursorScreenPoint()));
+  }, POINTER_POLL_MS);
+  if (pointerTimer.unref) pointerTimer.unref();
 }
 
 function setExpanded(next) {
   if (expanded === next || !win) return;
   expanded = next;
-  applyBounds();
+  if (FIXED_SIZE) passPointerThrough(!next);
+  else applyBounds();
 }
 
 function createTray() {
@@ -258,8 +316,12 @@ function refreshTrayMenu() {
       {
         label: 'Show tab (reset position)',
         click: () => {
+          // A tab dragged onto a display that has since been unplugged would
+          // otherwise stay lost, so this really does reset where it sits.
+          settings.save({ display: 'primary', offset: 0 });
           if (!win || win.isDestroyed()) createWindow();
           else {
+            sendConfig();
             win.showInactive();
             applyBounds();
           }
@@ -308,6 +370,35 @@ function wireIpc() {
     // crosses the seam between the pill and the expanded body.
     clearTimeout(collapseTimer);
     collapseTimer = setTimeout(() => setExpanded(false), 180);
+  });
+
+  ipcMain.on('sup:drag-start', () => {
+    clearTimeout(collapseTimer);
+    dragPlacement = {};
+    setExpanded(false);
+    // The drag's own pointer events must keep arriving until it is dropped.
+    passPointerThrough(false);
+  });
+
+  ipcMain.on('sup:drag-move', (_e, point) => {
+    if (!dragPlacement || !point) return;
+    const next = placementAt(point);
+    const edgeChanged = next.edge !== currentConfig().edge;
+    dragPlacement = next;
+    applyBounds();
+    // The tab rotates when it moves to an edge with the other orientation.
+    if (edgeChanged) sendConfig();
+  });
+
+  ipcMain.on('sup:drag-end', (_e, point) => {
+    if (!dragPlacement) return;
+    const dropped = point ? placementAt(point) : dragPlacement;
+    dragPlacement = null;
+    passPointerThrough(!expanded);
+    if (dropped.edge) settings.save(dropped);
+    applyBounds();
+    sendConfig();
+    refreshTrayMenu();
   });
 
   ipcMain.on('sup:refresh', () => poller.refreshNow());
