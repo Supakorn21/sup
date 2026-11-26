@@ -2,7 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { app, BrowserWindow, ipcMain, screen, Tray, Menu, shell, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Tray, Menu, shell, nativeImage, powerMonitor } = require('electron');
 
 const settings = require('./settings');
 const placement = require('./placement');
@@ -179,6 +179,13 @@ function createWindow() {
     console.error(`Sup: the tab failed to load (${code} ${description}).`);
   });
 
+  win.webContents.on('render-process-gone', (_e, details) => {
+    // A window already replaced (or shut down on purpose) is not news.
+    if (win !== created || details.reason === 'clean-exit') return;
+    console.error(`Sup: the tab's renderer went away (${details.reason}); rebuilding it.`);
+    scheduleRebuild();
+  });
+
   win.on('closed', () => {
     clearTimeout(fallback);
     // A replacement window may already have been created by then.
@@ -199,6 +206,58 @@ function recreateWindow() {
   expanded = false;
   if (old && !old.isDestroyed()) old.destroy();
   createWindow();
+}
+
+/**
+ * The tab must never be silently gone. Sleep, closing the lid onto an
+ * external display (clamshell) or a display change can take Chromium's GPU
+ * process down, and with it the page: the window stays on screen, fully
+ * transparent, with nothing drawn in it, and nothing ever redraws it. So when
+ * the renderer or GPU process dies, after waking, and whenever a periodic
+ * check finds the page dead, build a fresh window.
+ */
+let rebuildTimer = null;
+
+function scheduleRebuild(delayMs = 1500) {
+  clearTimeout(rebuildTimer);
+  // Give Chromium a moment to bring its GPU process back first.
+  rebuildTimer = setTimeout(() => {
+    rebuildTimer = null;
+    recreateWindow();
+  }, delayMs);
+}
+
+function pageIsDead() {
+  if (!win || win.isDestroyed()) return true;
+  const wc = win.webContents;
+  try {
+    return wc.isDestroyed() || wc.isCrashed() || !wc.mainFrame || wc.mainFrame.isDestroyed();
+  } catch {
+    // Touching a disposed frame throws: that is an answer too.
+    return true;
+  }
+}
+
+function watchHealth() {
+  app.on('child-process-gone', (_e, details) => {
+    if (details.type !== 'GPU') return;
+    console.error(`Sup: the GPU process went away (${details.reason}); rebuilding the tab.`);
+    scheduleRebuild();
+  });
+
+  // Rebuilding on wake is cheap and catches what no event reports.
+  powerMonitor.on('resume', () => scheduleRebuild(3000));
+  powerMonitor.on('unlock-screen', () => {
+    if (pageIsDead()) scheduleRebuild();
+  });
+
+  const timer = setInterval(() => {
+    if (!rebuildTimer && pageIsDead()) {
+      console.error('Sup: found the tab dead; rebuilding it.');
+      scheduleRebuild(0);
+    }
+  }, 30000);
+  if (timer.unref) timer.unref();
 }
 
 function sendConfig() {
@@ -441,6 +500,7 @@ function main() {
     wireIpc();
     createWindow();
     createTray();
+    watchHealth();
     poller.start();
 
     screen.on('display-metrics-changed', applyBounds);
